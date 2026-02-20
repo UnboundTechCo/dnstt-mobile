@@ -1,48 +1,210 @@
 package mobile
 
 import (
+	"log"
 	"net"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
-// BroadcastUDPConn wraps a single UDP socket and broadcasts every query to all
-// resolvers. The first response wins — this maximizes reliability during
-// internet shutdowns where some resolvers may be blocked.
-type BroadcastUDPConn struct {
-	conn  *net.UDPConn
-	addrs []*net.UDPAddr
+const (
+	// deadTimeout is how long a resolver can go without responding (while
+	// we are actively sending to it) before it is marked dead.
+	deadTimeout = 20 * time.Second
+	// probeInterval is the minimum gap between sending probe traffic to a
+	// dead resolver to check whether it has recovered.
+	probeInterval = 15 * time.Second
+	// healthCheckInterval is how often the background health loop runs.
+	healthCheckInterval = 10 * time.Second
+)
+
+// resolverState tracks per-resolver health.
+type resolverState struct {
+	alive     bool
+	lastSend  time.Time
+	lastRecv  time.Time
+	lastProbe time.Time
 }
 
-// NewBroadcastUDPConn creates a single UDP socket that sends to all resolvers.
-func NewBroadcastUDPConn(addrs []*net.UDPAddr) (*BroadcastUDPConn, error) {
+// resolverTracker provides shared health-tracking logic for smart connectors.
+// It maintains per-resolver state and picks the best resolver for each query.
+type resolverTracker struct {
+	mu       sync.Mutex
+	states   []resolverState
+	rrIndex  uint64 // round-robin counter (atomic)
+	stopCh   chan struct{}
+	stopOnce sync.Once
+}
+
+func newResolverTracker(n int) *resolverTracker {
+	states := make([]resolverState, n)
+	now := time.Now()
+	for i := range states {
+		states[i] = resolverState{
+			alive:    true,
+			lastRecv: now,
+		}
+	}
+	t := &resolverTracker{
+		states: states,
+		stopCh: make(chan struct{}),
+	}
+	go t.healthLoop()
+	return t
+}
+
+// pickBest selects one resolver index. It first checks for a dead resolver
+// that is due for a probe (to discover recovery). Otherwise it round-robins
+// among alive resolvers. If all are dead, it round-robins among all.
+func (t *resolverTracker) pickBest() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	now := time.Now()
+	n := len(t.states)
+
+	// Phase 1: look for a dead resolver due for a probe.
+	for i := 0; i < n; i++ {
+		s := &t.states[i]
+		if !s.alive && now.Sub(s.lastProbe) >= probeInterval {
+			s.lastProbe = now
+			return i
+		}
+	}
+
+	// Phase 2: round-robin among alive resolvers.
+	start := int(atomic.AddUint64(&t.rrIndex, 1) - 1)
+	for i := 0; i < n; i++ {
+		idx := (start + i) % n
+		if t.states[idx].alive {
+			return idx
+		}
+	}
+
+	// Phase 3: all dead — round-robin among all (KCP handles retransmission).
+	return start % n
+}
+
+func (t *resolverTracker) markSent(idx int) {
+	t.mu.Lock()
+	t.states[idx].lastSend = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *resolverTracker) markRecv(idx int) {
+	t.mu.Lock()
+	if !t.states[idx].alive {
+		log.Printf("resolver %d recovered", idx)
+	}
+	t.states[idx].alive = true
+	t.states[idx].lastRecv = time.Now()
+	t.mu.Unlock()
+}
+
+func (t *resolverTracker) markDead(idx int) {
+	t.mu.Lock()
+	if t.states[idx].alive {
+		log.Printf("resolver %d marked dead", idx)
+		t.states[idx].alive = false
+	}
+	t.mu.Unlock()
+}
+
+// healthLoop periodically checks for resolvers that have stopped responding.
+func (t *resolverTracker) healthLoop() {
+	ticker := time.NewTicker(healthCheckInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			t.checkHealth()
+		case <-t.stopCh:
+			return
+		}
+	}
+}
+
+func (t *resolverTracker) checkHealth() {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := time.Now()
+	for i := range t.states {
+		s := &t.states[i]
+		if s.alive && !s.lastSend.IsZero() &&
+			now.Sub(s.lastRecv) > deadTimeout &&
+			now.Sub(s.lastSend) < deadTimeout {
+			log.Printf("resolver %d marked dead (no response for %v)", i, now.Sub(s.lastRecv).Round(time.Second))
+			s.alive = false
+		}
+	}
+}
+
+func (t *resolverTracker) close() {
+	t.stopOnce.Do(func() { close(t.stopCh) })
+}
+
+// ---------------------------------------------------------------------------
+// SmartUDPConn — replaces BroadcastUDPConn
+// ---------------------------------------------------------------------------
+
+// SmartUDPConn wraps a single UDP socket and routes each query to ONE resolver
+// via health-tracking round-robin. Dead resolvers are periodically probed for
+// recovery.
+type SmartUDPConn struct {
+	conn    *net.UDPConn
+	addrs   []*net.UDPAddr
+	addrMap map[string]int // IP:port → index for markRecv
+	tracker *resolverTracker
+}
+
+// NewSmartUDPConn creates a smart UDP conn that distributes queries across resolvers.
+func NewSmartUDPConn(addrs []*net.UDPAddr) (*SmartUDPConn, error) {
 	conn, err := net.ListenUDP("udp", nil)
 	if err != nil {
 		return nil, err
 	}
-	return &BroadcastUDPConn{conn: conn, addrs: addrs}, nil
+	addrMap := make(map[string]int, len(addrs))
+	for i, a := range addrs {
+		addrMap[a.String()] = i
+	}
+	return &SmartUDPConn{
+		conn:    conn,
+		addrs:   addrs,
+		addrMap: addrMap,
+		tracker: newResolverTracker(len(addrs)),
+	}, nil
 }
 
-func (b *BroadcastUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
-	return b.conn.ReadFrom(p)
+func (s *SmartUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	idx := s.tracker.pickBest()
+	s.tracker.markSent(idx)
+	return s.conn.WriteTo(p, s.addrs[idx])
 }
 
-func (b *BroadcastUDPConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	var n int
-	for _, addr := range b.addrs {
-		nn, err := b.conn.WriteTo(p, addr)
-		if err == nil {
-			n = nn
+func (s *SmartUDPConn) ReadFrom(p []byte) (int, net.Addr, error) {
+	n, addr, err := s.conn.ReadFrom(p)
+	if err == nil {
+		if idx, ok := s.addrMap[addr.String()]; ok {
+			s.tracker.markRecv(idx)
 		}
 	}
-	return n, nil
+	return n, addr, err
 }
 
-func (b *BroadcastUDPConn) Close() error                       { return b.conn.Close() }
-func (b *BroadcastUDPConn) LocalAddr() net.Addr                { return b.conn.LocalAddr() }
-func (b *BroadcastUDPConn) SetDeadline(t time.Time) error      { return b.conn.SetDeadline(t) }
-func (b *BroadcastUDPConn) SetReadDeadline(t time.Time) error  { return b.conn.SetReadDeadline(t) }
-func (b *BroadcastUDPConn) SetWriteDeadline(t time.Time) error { return b.conn.SetWriteDeadline(t) }
+func (s *SmartUDPConn) Close() error {
+	s.tracker.close()
+	return s.conn.Close()
+}
+
+func (s *SmartUDPConn) LocalAddr() net.Addr                { return s.conn.LocalAddr() }
+func (s *SmartUDPConn) SetDeadline(t time.Time) error      { return s.conn.SetDeadline(t) }
+func (s *SmartUDPConn) SetReadDeadline(t time.Time) error  { return s.conn.SetReadDeadline(t) }
+func (s *SmartUDPConn) SetWriteDeadline(t time.Time) error { return s.conn.SetWriteDeadline(t) }
+
+// ---------------------------------------------------------------------------
+// AddrNormConn — unchanged
+// ---------------------------------------------------------------------------
 
 // AddrNormConn wraps a net.PacketConn and overrides ReadFrom to always return
 // a fixed address. This is needed because kcp-go filters incoming packets by
@@ -58,41 +220,50 @@ func (a *AddrNormConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	return n, a.fixedAddr, err
 }
 
-// MultiPacketConn multiplexes across multiple net.PacketConn transports (for DoT).
-// It broadcasts writes and aggregates reads via a shared channel.
-type MultiPacketConn struct {
-	transports []net.PacketConn
-	addrs      []net.Addr
-	recvCh     chan recvMsg
-	closeCh    chan struct{}
-	closeOnce  sync.Once
-}
+// ---------------------------------------------------------------------------
+// SmartMultiPacketConn — replaces MultiPacketConn (for DoT)
+// ---------------------------------------------------------------------------
 
 type recvMsg struct {
 	data []byte
 	addr net.Addr
 }
 
-func NewMultiPacketConn(transports []net.PacketConn, addrs []net.Addr) *MultiPacketConn {
-	m := &MultiPacketConn{
+// SmartMultiPacketConn multiplexes across multiple net.PacketConn transports
+// (for DoT). It routes each write to ONE transport via health-tracking
+// round-robin and aggregates reads via a shared channel.
+type SmartMultiPacketConn struct {
+	transports []net.PacketConn
+	addrs      []net.Addr
+	recvCh     chan recvMsg
+	closeCh    chan struct{}
+	closeOnce  sync.Once
+	tracker    *resolverTracker
+}
+
+func NewSmartMultiPacketConn(transports []net.PacketConn, addrs []net.Addr) *SmartMultiPacketConn {
+	m := &SmartMultiPacketConn{
 		transports: transports,
 		addrs:      addrs,
 		recvCh:     make(chan recvMsg, 256),
 		closeCh:    make(chan struct{}),
+		tracker:    newResolverTracker(len(transports)),
 	}
-	for _, t := range transports {
-		go m.recvLoop(t)
+	for i, t := range transports {
+		go m.recvLoop(i, t)
 	}
 	return m
 }
 
-func (m *MultiPacketConn) recvLoop(transport net.PacketConn) {
+func (m *SmartMultiPacketConn) recvLoop(idx int, transport net.PacketConn) {
 	for {
 		buf := make([]byte, 4096)
 		n, addr, err := transport.ReadFrom(buf)
 		if err != nil {
+			m.tracker.markDead(idx)
 			return
 		}
+		m.tracker.markRecv(idx)
 		msg := recvMsg{data: make([]byte, n), addr: addr}
 		copy(msg.data, buf[:n])
 		select {
@@ -103,7 +274,7 @@ func (m *MultiPacketConn) recvLoop(transport net.PacketConn) {
 	}
 }
 
-func (m *MultiPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
+func (m *SmartMultiPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	msg, ok := <-m.recvCh
 	if !ok {
 		return 0, nil, net.ErrClosed
@@ -111,19 +282,25 @@ func (m *MultiPacketConn) ReadFrom(p []byte) (int, net.Addr, error) {
 	return copy(p, msg.data), msg.addr, nil
 }
 
-func (m *MultiPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
-	var n int
-	for i, t := range m.transports {
-		nn, err := t.WriteTo(p, m.addrs[i])
-		if err == nil {
-			n = nn
+func (m *SmartMultiPacketConn) WriteTo(p []byte, _ net.Addr) (int, error) {
+	idx := m.tracker.pickBest()
+	m.tracker.markSent(idx)
+	n, err := m.transports[idx].WriteTo(p, m.addrs[idx])
+	if err != nil {
+		m.tracker.markDead(idx)
+		// Retry once with the next best resolver.
+		idx2 := m.tracker.pickBest()
+		if idx2 != idx {
+			m.tracker.markSent(idx2)
+			return m.transports[idx2].WriteTo(p, m.addrs[idx2])
 		}
 	}
-	return n, nil
+	return n, err
 }
 
-func (m *MultiPacketConn) Close() error {
+func (m *SmartMultiPacketConn) Close() error {
 	m.closeOnce.Do(func() {
+		m.tracker.close()
 		close(m.closeCh)
 		for _, t := range m.transports {
 			t.Close()
@@ -133,7 +310,7 @@ func (m *MultiPacketConn) Close() error {
 	return nil
 }
 
-func (m *MultiPacketConn) LocalAddr() net.Addr                { return m.transports[0].LocalAddr() }
-func (m *MultiPacketConn) SetDeadline(t time.Time) error      { return nil }
-func (m *MultiPacketConn) SetReadDeadline(t time.Time) error  { return nil }
-func (m *MultiPacketConn) SetWriteDeadline(t time.Time) error { return nil }
+func (m *SmartMultiPacketConn) LocalAddr() net.Addr                { return m.transports[0].LocalAddr() }
+func (m *SmartMultiPacketConn) SetDeadline(t time.Time) error      { return nil }
+func (m *SmartMultiPacketConn) SetReadDeadline(t time.Time) error  { return nil }
+func (m *SmartMultiPacketConn) SetWriteDeadline(t time.Time) error { return nil }

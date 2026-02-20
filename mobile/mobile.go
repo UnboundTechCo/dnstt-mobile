@@ -46,6 +46,10 @@ type DnsttClient struct {
 	pubkey       []byte
 	listenAddr   string
 
+	// authoritativeMode selects aggressive settings for self-hosted DNS
+	// resolvers (more senders, larger poll burst, faster KCP, bigger buffers).
+	authoritativeMode bool
+
 	mu       sync.Mutex
 	running  bool
 	cancel   context.CancelFunc
@@ -79,6 +83,18 @@ func NewClient(dnsAddr, tunnelDomain, publicKey, listenAddr string) (*DnsttClien
 		pubkey:       pubkey,
 		listenAddr:   listenAddr,
 	}, nil
+}
+
+// SetAuthoritativeMode enables or disables aggressive query-rate settings.
+// When true (for self-hosted / authoritative DNS resolvers):
+//   - DoH senders: 32 (vs 8)
+//   - pollLimit: 16 (vs 8)
+//   - KCP turbo mode with larger windows and buffers
+//   - Faster polling (200ms init, 4s max vs 500ms/10s)
+//
+// Must be called before Start.
+func (c *DnsttClient) SetAuthoritativeMode(enabled bool) {
+	c.authoritativeMode = enabled
 }
 
 // Start begins the DNSTT tunnel in a background goroutine.
@@ -126,7 +142,17 @@ func (c *DnsttClient) Start() error {
 		} else {
 			rt = dnsttclient.NewUTLSRoundTripper(nil, utlsID)
 		}
-		pconn, err = dnsttclient.NewHTTPPacketConn(rt, c.dnsAddr, 32)
+		numSenders := 8
+		var httpConfig *dnsttclient.HTTPPacketConnConfig
+		if c.authoritativeMode {
+			numSenders = 32
+		} else {
+			httpConfig = &dnsttclient.HTTPPacketConnConfig{
+				RetryAfterDefault: 2 * time.Second,
+				SleepOnRateLimit:  true,
+			}
+		}
+		pconn, err = dnsttclient.NewHTTPPacketConnWithConfig(rt, c.dnsAddr, numSenders, httpConfig)
 		if err != nil {
 			cancel()
 			return fmt.Errorf("creating DoH transport: %v", err)
@@ -172,8 +198,8 @@ func (c *DnsttClient) Start() error {
 				transports = append(transports, t)
 				tAddrs = append(tAddrs, turbotunnel.DummyAddr{})
 			}
-			pconn = NewMultiPacketConn(transports, tAddrs)
-			log.Printf("multi-resolver DoT: %d transports", len(transports))
+			pconn = NewSmartMultiPacketConn(transports, tAddrs)
+			log.Printf("multi-resolver DoT: %d transports (smart)", len(transports))
 		}
 		remoteAddr = turbotunnel.DummyAddr{}
 
@@ -203,19 +229,36 @@ func (c *DnsttClient) Start() error {
 				}
 				udpAddrs = append(udpAddrs, addr)
 			}
-			bconn, bErr := NewBroadcastUDPConn(udpAddrs)
-			if bErr != nil {
+			sconn, sErr := NewSmartUDPConn(udpAddrs)
+			if sErr != nil {
 				cancel()
-				return fmt.Errorf("opening UDP socket: %v", bErr)
+				return fmt.Errorf("opening UDP socket: %v", sErr)
 			}
-			pconn = bconn
+			pconn = sconn
 			remoteAddr = turbotunnel.DummyAddr{}
-			log.Printf("multi-resolver UDP: %d resolvers (broadcast)", len(udpAddrs))
+			log.Printf("multi-resolver UDP: %d resolvers (smart)", len(udpAddrs))
 		}
 	}
 
+	// Save the raw transport conn so we can close it explicitly. The
+	// wrapping layers (DNSPacketConn, AddrNormConn) don't propagate
+	// Close to the underlying transport, so SmartUDPConn/SmartMultiPacketConn
+	// would leak their healthLoop goroutine without this.
+	transportConn := pconn
+
 	// Wrap the transport with DNSPacketConn for DNS encoding.
-	pconn = dnsttclient.NewDNSPacketConn(pconn, remoteAddr, domain)
+	var dnsConfig *dnsttclient.DNSPacketConnConfig
+	if c.authoritativeMode {
+		// Aggressive: faster polling for lower latency
+		dnsConfig = &dnsttclient.DNSPacketConnConfig{
+			PollLimit:     16,
+			InitPollDelay: 200 * time.Millisecond,
+			MaxPollDelay:  4 * time.Second,
+		}
+	} else {
+		dnsConfig = &dnsttclient.DNSPacketConnConfig{PollLimit: 8}
+	}
+	pconn = dnsttclient.NewDNSPacketConnWithConfig(pconn, remoteAddr, domain, dnsConfig)
 
 	// For multi-resolver, normalize addresses on ReadFrom so KCP's address
 	// filter doesn't drop packets. KCP compares addr.String() from ReadFrom
@@ -236,6 +279,7 @@ func (c *DnsttClient) Start() error {
 	c.running = true
 
 	go func() {
+		defer transportConn.Close()
 		err := c.run(ctx, c.pubkey, domain, localAddr, remoteAddr, pconn)
 		if err != nil && ctx.Err() == nil {
 			log.Printf("dnstt client: %v", err)
@@ -313,7 +357,8 @@ func utlsDialContext(ctx context.Context, network, addr string, config *utls.Con
 }
 
 // handle proxies data between a local TCP connection and a smux stream.
-func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
+// copyBufSize controls the io.CopyBuffer size; 0 means use io.Copy (default 32KB).
+func handle(local *net.TCPConn, sess *smux.Session, conv uint32, copyBufSize int) error {
 	stream, err := sess.OpenStream()
 	if err != nil {
 		return fmt.Errorf("session %08x opening stream: %v", conv, err)
@@ -324,11 +369,18 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 	}()
 	log.Printf("begin stream %08x:%d", conv, stream.ID())
 
+	doCopy := func(dst io.Writer, src io.Reader) (int64, error) {
+		if copyBufSize > 0 {
+			return io.CopyBuffer(dst, src, make([]byte, copyBufSize))
+		}
+		return io.Copy(dst, src)
+	}
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(stream, local)
+		_, err := doCopy(stream, local)
 		if err == io.EOF {
 			err = nil
 		}
@@ -340,7 +392,7 @@ func handle(local *net.TCPConn, sess *smux.Session, conv uint32) error {
 	}()
 	go func() {
 		defer wg.Done()
-		_, err := io.Copy(local, stream)
+		_, err := doCopy(local, stream)
 		if err == io.EOF {
 			err = nil
 		}
@@ -390,10 +442,17 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 	}()
 	log.Printf("begin session %08x", conn.GetConv())
 
-	// Upstream KCP defaults.
 	conn.SetStreamMode(true)
-	conn.SetNoDelay(0, 0, 0, 1)
-	conn.SetWindowSize(64, 64)
+	if c.authoritativeMode {
+		// Aggressive: KCP turbo mode — 20ms flush, fast retransmit, 30ms min RTO
+		conn.SetNoDelay(1, 20, 2, 1)
+		conn.SetACKNoDelay(true)
+		conn.SetWindowSize(256, 256)
+	} else {
+		// Conservative: upstream KCP defaults
+		conn.SetNoDelay(0, 0, 0, 1)
+		conn.SetWindowSize(64, 64)
+	}
 	if rc := conn.SetMtu(mtu); !rc {
 		panic(rc)
 	}
@@ -407,11 +466,22 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 	smuxConfig := smux.DefaultConfig()
 	smuxConfig.Version = 2
 	smuxConfig.KeepAliveTimeout = idleTimeout
+	if c.authoritativeMode {
+		// Aggressive: larger buffers for better throughput
+		smuxConfig.MaxStreamBuffer = 4 * 1024 * 1024  // 4MB (default 64KB)
+		smuxConfig.MaxReceiveBuffer = 16 * 1024 * 1024 // 16MB (default 4MB)
+	}
 	sess, err := smux.Client(rw, smuxConfig)
 	if err != nil {
 		return fmt.Errorf("opening smux session: %v", err)
 	}
 	defer sess.Close()
+
+	// Aggressive mode: 128KB copy buffer (default 32KB)
+	copyBufSize := 0
+	if c.authoritativeMode {
+		copyBufSize = 128 * 1024
+	}
 
 	for {
 		local, err := ln.Accept()
@@ -426,7 +496,7 @@ func (c *DnsttClient) run(ctx context.Context, pubkey []byte, domain dns.Name, l
 		}
 		go func() {
 			defer local.Close()
-			err := handle(local.(*net.TCPConn), sess, conn.GetConv())
+			err := handle(local.(*net.TCPConn), sess, conn.GetConv(), copyBufSize)
 			if err != nil {
 				log.Printf("handle: %v", err)
 			}
