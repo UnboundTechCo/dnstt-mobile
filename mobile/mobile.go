@@ -50,10 +50,11 @@ type DnsttClient struct {
 	// resolvers (more senders, larger poll burst, faster KCP, bigger buffers).
 	authoritativeMode bool
 
-	mu       sync.Mutex
-	running  bool
-	cancel   context.CancelFunc
-	listener net.Listener
+	mu            sync.Mutex
+	running       bool
+	cancel        context.CancelFunc
+	listener      net.Listener
+	transportConn net.PacketConn // raw UDP/DoH/DoT transport — closed in Stop to kill sendLoop immediately
 }
 
 // NewClient creates a new DNSTT client. Transport is auto-detected from dnsAddr:
@@ -245,6 +246,7 @@ func (c *DnsttClient) Start() error {
 	// Close to the underlying transport, so SmartUDPConn/SmartMultiPacketConn
 	// would leak their healthLoop goroutine without this.
 	transportConn := pconn
+	c.transportConn = pconn // also store on struct so Stop() can close it immediately
 
 	// Wrap the transport with DNSPacketConn for DNS encoding.
 	var dnsConfig *dnsttclient.DNSPacketConnConfig
@@ -304,6 +306,12 @@ func (c *DnsttClient) Stop() {
 	if c.listener != nil {
 		c.listener.Close()
 		c.listener = nil
+	}
+	// Close the raw transport immediately so sendLoop/recvLoop exit
+	// instead of retrying on the closed socket for seconds.
+	if c.transportConn != nil {
+		c.transportConn.Close()
+		c.transportConn = nil
 	}
 	c.running = false
 }
