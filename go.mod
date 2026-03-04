@@ -6,7 +6,6 @@ require (
 	github.com/refraction-networking/utls v1.8.2
 	github.com/xtaci/kcp-go/v5 v5.6.61
 	github.com/xtaci/smux v1.5.50
-	golang.org/x/mobile v0.0.0-20260204172633-1dceadbbeea3
 	www.bamsoftware.com/git/dnstt.git v0.0.0-00010101000000-000000000000
 )
 
