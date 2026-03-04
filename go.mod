@@ -1,4 +1,4 @@
-module dnstt-mobile
+module github.com/UnboundTechCo/dnstt-mobile
 
 go 1.24.0
 
